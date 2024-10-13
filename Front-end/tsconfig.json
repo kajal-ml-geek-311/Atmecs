@@ -1,0 +1,21 @@
+{
+  "compilerOptions": {
+    "target": "ES6",
+    "lib": ["DOM", "DOM.Iterable", "ESNext"],
+    "jsx": "react",
+    "module": "ESNext",
+    "moduleResolution": "Node",
+    "strict": true,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    "allowSyntheticDefaultImports": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "noEmit": true
+  },
+  "include": [
+    "src",
+    "src/custom.d.ts"
+  ]
+}
