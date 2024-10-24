@@ -1,3 +1,4 @@
+ 
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request, Body
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
@@ -11,507 +12,680 @@ from gtts import gTTS
 import base64
 import os
 from dotenv import load_dotenv
-import requests
-import logging
-from torchvision import transforms
-from typing import Optional, List
+import pytesseract
+import pdf2image
+import pydicom
+import nibabel as nib
+import pandas as pd
+from typing import Optional, List, Dict
 from pydantic import BaseModel
 import json
+import logging
+from datetime import datetime
+from torchvision import transforms
 
 # Load environment variables
 load_dotenv()
 api_key = os.getenv("OPENAI_API_KEY")
 if not api_key:
     raise ValueError("OPENAI_API_KEY is not set in the environment variables.")
+
+# Initialize OpenAI client
 client = OpenAI(api_key=api_key)
 
-# Device configuration
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-logging.basicConfig(level=logging.INFO)
-logging.info(f"Using device: {device}")
-
-# Load the pre-trained DenseNet model with correct weights
-try:
-    model = xrv.models.DenseNet(weights="densenet121-res224-all")  # Use a valid weights string
-    logging.info("DenseNet model loaded successfully with weights='densenet121-res224-all'.")
-except Exception as e:
-    logging.error(f"Error loading DenseNet model: {e}")
-    raise
-
-model = model.to(device)
-model.eval()
-
-# Verify the first layer to ensure it accepts 1 input channel
-first_layer = model.features[0]
-logging.info(f"First layer of the model: {first_layer}")
-if first_layer.in_channels != 1:
-    raise ValueError(f"Expected first layer to have in_channels=1, but got in_channels={first_layer.in_channels}.")
-
-# Initialize the FastAPI app
-app = FastAPI()
-
-# Allow CORS so frontend can communicate with backend
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # Adjust this in production for security
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
+logger = logging.getLogger(__name__)
 
 # Supported languages
 SUPPORTED_LANGUAGES = {
-    'en': "Respond in English.",
+    'en-GB': "Respond in English.",
     'hi': "Respond in Hindi.",
-    # Add more languages and corresponding instructions as needed
+    'te': "Respond in Telugu."
 }
 
 # Set up patient data directory
 PATIENT_DATA_DIR = 'patient_data'
 os.makedirs(PATIENT_DATA_DIR, exist_ok=True)
 
+class MedicalAI:
+    def __init__(self):
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        logger.info(f"Using device: {self.device}")
+        self.models = self._load_models()
+        self.supported_formats = {
+            'xray': ['.dcm', '.png', '.jpg', '.jpeg'],
+            'mri': ['.nii', '.nii.gz', '.dcm'],
+            'ct': ['.dcm', '.nii', '.nii.gz'],
+            'reports': ['.pdf', '.png', '.jpg', '.jpeg'],
+            'blood_work': ['.pdf', '.csv', '.xlsx']
+        }
+
+    def _load_models(self) -> Dict:
+        """Load all required AI models"""
+        try:
+            models = {
+                'xray': xrv.models.DenseNet(weights="densenet121-res224-all").to(self.device)
+            }
+            models['xray'].eval()
+            return models
+        except Exception as e:
+            logger.error(f"Error loading models: {e}")
+            raise
+
+    def _preprocess_image(self, image: Image.Image) -> torch.Tensor:
+        """Preprocess image for model input"""
+        transform = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.Grayscale(num_output_channels=1),
+            transforms.ToTensor(),
+        ])
+        
+        image_tensor = transform(image).unsqueeze(0)
+        return image_tensor.to(self.device)
+
+    async def process_medical_file(self, file: UploadFile, file_type: str) -> dict:
+        """Process different types of medical files"""
+        content = await file.read()
+        ext = os.path.splitext(file.filename)[1].lower()
+        
+        try:
+            if file_type == 'xray' and ext in self.supported_formats['xray']:
+                return await self._process_xray(content)
+            elif file_type in ['mri', 'ct'] and ext in self.supported_formats[file_type]:
+                return await self._process_scan(content, file_type)
+            elif file_type == 'blood_work' and ext in self.supported_formats['blood_work']:
+                return await self._process_blood_work(content, ext)
+            elif file_type == 'reports' and ext in self.supported_formats['reports']:
+                return await self._process_medical_report(content, ext)
+            else:
+                raise HTTPException(
+                    status_code=400, 
+                    detail=f"Unsupported file format {ext} for {file_type}"
+                )
+        except Exception as e:
+            logger.error(f"Error processing {file_type} file: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    async def _process_xray(self, content: bytes) -> dict:
+        """Process X-ray images"""
+        try:
+            image = Image.open(io.BytesIO(content)).convert('L')
+            tensor = self._preprocess_image(image)
+            
+            with torch.no_grad():
+                preds = self.models['xray'](tensor)
+            
+            labels = xrv.datasets.default_pathologies
+            pred_probs = preds.cpu().numpy()[0]
+            
+            findings = [
+                {
+                    "condition": label,
+                    "probability": float(prob),
+                    "significance": "high" if prob > 0.7 else "medium" if prob > 0.4 else "low"
+                }
+                for label, prob in zip(labels, pred_probs)
+                if prob > 0.1  # Only include findings with >10% probability
+            ]
+            
+            return {
+                'type': 'xray',
+                'findings': findings,
+                'analysis_timestamp': datetime.now().isoformat()
+            }
+        except Exception as e:
+            logger.error(f"Error processing X-ray: {e}")
+            raise
+
+    async def _process_scan(self, content: bytes, scan_type: str) -> dict:
+        """Process MRI or CT scan data"""
+        try:
+            # Save temporary file
+            temp_file = f"temp_{scan_type}_{datetime.now().timestamp()}"
+            with open(temp_file, 'wb') as f:
+                f.write(content)
+            
+            if scan_type == 'mri':
+                scan_data = nib.load(temp_file)
+            else:  # CT scan
+                scan_data = pydicom.dcmread(temp_file)
+            
+            # Process scan data and generate findings
+            # This is a placeholder for actual scan processing logic
+            findings = {
+                'type': scan_type,
+                'scan_date': datetime.now().isoformat(),
+                'findings': f"Detailed {scan_type} analysis would go here",
+                'recommendations': []
+            }
+            
+            # Cleanup
+            os.remove(temp_file)
+            
+            return findings
+        except Exception as e:
+            logger.error(f"Error processing {scan_type}: {e}")
+            raise
+
+    async def _process_blood_work(self, content: bytes, ext: str) -> dict:
+        """Process blood work reports"""
+        try:
+            if ext == '.pdf':
+                text = await self._extract_text_from_pdf(content)
+            elif ext in ['.csv', '.xlsx']:
+                df = pd.read_csv(io.BytesIO(content)) if ext == '.csv' else pd.read_excel(io.BytesIO(content))
+                text = df.to_string()
+            
+            analysis = await self._analyze_blood_work(text)
+            return {
+                'type': 'blood_work',
+                'findings': analysis,
+                'analysis_timestamp': datetime.now().isoformat()
+            }
+        except Exception as e:
+            logger.error(f"Error processing blood work: {e}")
+            raise
+
+    async def _extract_text_from_pdf(self, content: bytes) -> str:
+        """Extract text from PDF files"""
+        try:
+            images = pdf2image.convert_from_bytes(content)
+            text = ""
+            for image in images:
+                text += pytesseract.image_to_string(image)
+            return text
+        except Exception as e:
+            logger.error(f"Error extracting text from PDF: {e}")
+            raise
+
+    async def _analyze_blood_work(self, text: str) -> dict:
+        """Analyze blood work results using GPT-4"""
+        try:
+            prompt = f"""
+            Analyze the following blood work results and provide:
+            1. Abnormal values and their clinical significance
+            2. Overall health assessment
+            3. Recommended follow-up tests if any
+            4. Lifestyle and dietary recommendations
+            
+            Blood Work Results:
+            {text}
+            """
+            
+            response = client.chat.completions.create(
+                model="gpt-4",
+                messages=[
+                    {"role": "system", "content": "You are a medical expert specialized in laboratory results interpretation."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.7
+            )
+            
+            return {
+                'analysis': response.choices[0].message.content,
+                'timestamp': datetime.now().isoformat()
+            }
+        except Exception as e:
+            logger.error(f"Error analyzing blood work: {e}")
+            raise
+
+    async def generate_diagnosis(self, patient_data: dict, medical_files: List[dict]) -> dict:
+        """Generate comprehensive diagnosis"""
+        try:
+            # Compile all findings
+            compiled_data = self._compile_medical_data(patient_data, medical_files)
+            
+            prompt = f"""
+            Based on the following patient data and medical findings, provide a comprehensive diagnosis:
+            
+            Patient Information:
+            {json.dumps(patient_data, indent=2)}
+            
+            Medical Findings:
+            {json.dumps(compiled_data, indent=2)}
+            
+            Please provide:
+            1. Primary diagnosis
+            2. Differential diagnoses
+            3. Supporting evidence
+            4. Recommended additional tests
+            5. Risk factors
+            6. Prognosis
+            """
+            
+            response = client.chat.completions.create(
+                model="gpt-4",
+                messages=[
+                    {"role": "system", "content": "You are an expert medical AI system providing comprehensive diagnoses."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.7
+            )
+            
+            return {
+                'diagnosis': response.choices[0].message.content,
+                'timestamp': datetime.now().isoformat(),
+                'data_sources': [file.get('type') for file in medical_files]
+            }
+        except Exception as e:
+            logger.error(f"Error generating diagnosis: {e}")
+            raise
+
+    def _compile_medical_data(self, patient_data: dict, medical_files: List[dict]) -> dict:
+        """Compile and organize all medical data"""
+        compiled_data = {
+            'xray_findings': [],
+            'scan_findings': [],
+            'blood_work_results': [],
+            'other_findings': []
+        }
+        
+        for file in medical_files:
+            file_type = file.get('type')
+            if file_type == 'xray':
+                compiled_data['xray_findings'].append(file.get('findings'))
+            elif file_type in ['mri', 'ct']:
+                compiled_data['scan_findings'].append(file.get('findings'))
+            elif file_type == 'blood_work':
+                compiled_data['blood_work_results'].append(file.get('findings'))
+            else:
+                compiled_data['other_findings'].append(file)
+        
+        return compiled_data
+
+# Initialize FastAPI app and medical AI system
+app = FastAPI(title="Medical AI Assistant")
+medical_ai = MedicalAI()
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 def get_patient_file_path(patient_id: str) -> str:
+    """Get the file path for patient data"""
     return os.path.join(PATIENT_DATA_DIR, f'patient_{patient_id}.json')
 
 def load_patient_history(patient_id: str) -> List[dict]:
+    """Load patient conversation history"""
     file_path = get_patient_file_path(patient_id)
     if not os.path.exists(file_path):
         return []
-    with open(file_path, 'r') as f:
-        try:
+    try:
+        with open(file_path, 'r') as f:
             data = json.load(f)
             return data.get('conversation', [])
-        except json.JSONDecodeError:
-            return []
+    except json.JSONDecodeError:
+        return []
+
+# Helper function for language validation
+def get_language_name(code: str) -> str:
+    """Convert language code to full name"""
+    language_names = {
+        'en-GB': 'English',
+        'hi': 'Hindi',
+        'te': 'Telugu'
+    }
+    return language_names.get(code, code)
 
 def save_patient_history(patient_id: str, conversation: list):
+    """Save patient conversation history"""
     file_path = get_patient_file_path(patient_id)
     with open(file_path, 'w') as f:
         json.dump({'conversation': conversation}, f, indent=4)
 
 def append_to_patient_history(patient_id: str, role: str, content: str):
+    """Append new message to patient history"""
     conversation = load_patient_history(patient_id)
-    conversation.append({'role': role, 'content': content})
+    conversation.append({
+        'role': role,
+        'content': content,
+        'timestamp': datetime.now().isoformat()
+    })
     save_patient_history(patient_id, conversation)
 
-# Updated Preprocessing function using torchvision transforms
-def preprocess_image(image: Image.Image) -> torch.Tensor:
-    """
-    Preprocess the input PIL image:
-    - Resize to 224x224
-    - Convert to grayscale
-    - Convert to tensor
-    - Add batch dimension
-    """
-    transform = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.Grayscale(num_output_channels=1),  # Ensure 1 channel
-        transforms.ToTensor(),  # Converts to [0, 1] and shapes to (C, H, W)
-    ])
-    
-    image = transform(image)
-    image_tensor = image.unsqueeze(0)  # Shape: (1, 1, 224, 224)
-    logging.debug(f"Preprocessed image tensor shape: {image_tensor.shape}")
-    return image_tensor
+class FileUploadRequest(BaseModel):
+    patient_id: str
+    file_type: str
 
-# Grad-CAM heatmap generation function (Placeholder)
-def generate_gradcam_heatmap(image_tensor: torch.Tensor, model: torch.nn.Module) -> np.ndarray:
-    """
-    Generate a Grad-CAM heatmap for the input image_tensor using the specified model.
-    This is a placeholder function. Implement Grad-CAM using libraries like torchcam for meaningful results.
-    """
-    # Placeholder: Return a dummy heatmap
-    heatmap = np.random.rand(224, 224)
-    return heatmap
+class DiagnosisRequest(BaseModel):
+    patient_id: str
+    patient_data: dict
+    medical_files: List[dict]
 
-# Diagnosis function with enhanced error handling and logging
-def get_diagnosis(image: Image.Image, patient_data: str, language: str = 'en') -> tuple:
-    """
-    Perform diagnosis based on the input image and patient data.
-    Returns:
-        diagnosis (str): The diagnosis text.
-        audio_bytes (bytes or None): The synthesized audio in the selected language.
-        heatmap (np.ndarray or None): The Grad-CAM heatmap.
-    """
-    try:
-        # Preprocess the image
-        image_tensor = preprocess_image(image)
-        image_tensor = image_tensor.to(device)
-        logging.info(f"Image tensor moved to device: {image_tensor.device}")
-
-        # Pass the image through the model
-        with torch.no_grad():
-            preds = model(image_tensor)
-        logging.debug(f"Model predictions: {preds}")
-
-        # Get predicted labels and probabilities
-        labels = xrv.datasets.default_pathologies
-        pred_probs = preds.cpu().numpy()[0]
-        logging.debug(f"Prediction probabilities: {pred_probs}")
-
-        # Get top 5 predictions
-        top_indices = np.argsort(pred_probs)[::-1][:5]
-        image_diagnosis = [(labels[i], pred_probs[i]) for i in top_indices]
-        logging.info(f"Top predictions: {image_diagnosis}")
-
-        # Generate Grad-CAM heatmap
-        heatmap = generate_gradcam_heatmap(image_tensor, model)
-        logging.debug(f"Generated heatmap shape: {heatmap.shape}")
-
-        # Prepare the prompt for GPT-4 with language specification
-        lang_instruction = SUPPORTED_LANGUAGES.get(language.lower(), SUPPORTED_LANGUAGES['en'])
-        image_analysis_text = "\n".join(
-            [f"{condition}: {prob:.2f}" for condition, prob in image_diagnosis]
-        )
-        prompt = f"""
-You are a medical AI assistant. {lang_instruction} Analyze the following medical image findings and patient data to provide a diagnosis.
-
-Patient Data:
-{patient_data}
-
-Image Analysis Results:
-{image_analysis_text}
-
-Provide a detailed diagnosis and suggest possible treatment options.
-"""
-
-        logging.debug(f"LLM Prompt: {prompt}")
-
-        # Call GPT-4 model using the OpenAI client
-        response = client.chat.completions.create(
-            model="gpt-4",
-            messages=[
-                {"role": "system", "content": "You are a helpful medical assistant."},
-                {"role": "user", "content": prompt},
-            ],
-            max_tokens=500,
-            temperature=0.7,
-        )
-        diagnosis = response.choices[0].message.content.strip()
-        logging.info("LLM responded successfully.")
-
-    except Exception as e:
-        logging.error(f"Error in get_diagnosis: {e}", exc_info=True)
-        diagnosis = f"An error occurred during diagnosis: {e}"
-        return diagnosis, None, None
-
-    # Generate audio from the diagnosis
-    try:
-        tts_language = 'en'  # Default to English
-        if language.lower() == 'hi':
-            tts_language = 'hi'
-
-        tts = gTTS(text=diagnosis, lang=tts_language)
-        tts_io = io.BytesIO()
-        tts.write_to_fp(tts_io)
-        tts_io.seek(0)
-
-        # Read audio bytes
-        audio_bytes = tts_io.read()
-        logging.info("Audio generated successfully.")
-    except Exception as e:
-        logging.error(f"Error generating audio: {e}", exc_info=True)
-        diagnosis += f"\n\nError generating audio: {e}"
-        audio_bytes = None
-
-    return diagnosis, audio_bytes, heatmap
-
-# Synthetic Data Generation function with logging
-def generate_synthetic_report(report_type: str, patient_age: int, patient_gender: str, medical_condition: str, language: str = 'en') -> str:
-    """
-    Generate a synthetic medical report based on the provided parameters.
-    Returns:
-        synthetic_report (str): The generated synthetic report.
-    """
-    try:
-        lang_instruction = "Respond in Hindi." if language.lower() == 'hi' else "Respond in English."
-        prompt = f"""
-You are a medical AI assistant. {lang_instruction} Generate a synthetic {report_type.lower()} for a {patient_age}-year-old {patient_gender} patient diagnosed with {medical_condition}. Ensure that the report is realistic and useful for research and training purposes. Do not include any real patient data. Anonymize any identifiable information.
-"""
-        logging.debug(f"LLM Prompt for synthetic report: {prompt}")
-
-        response = client.chat.completions.create(
-            model="gpt-4",
-            messages=[
-                {"role": "system", "content": "You are a helpful medical assistant generating synthetic medical data."},
-                {"role": "user", "content": prompt},
-            ],
-            max_tokens=800,
-            temperature=0.7,
-        )
-        synthetic_report = response.choices[0].message.content.strip()
-        logging.info("Synthetic report generated successfully.")
-    except Exception as e:
-        logging.error(f"Error in generate_synthetic_report: {e}", exc_info=True)
-        synthetic_report = f"An error occurred: {e}"
-
-    return synthetic_report
-
-# Treatment Plan Generation function with logging
-def generate_treatment_plan(patient_data: str, language: str = 'en') -> str:
-    """
-    Generate a personalized treatment plan based on patient data.
-    Returns:
-        treatment_plan (str): The generated treatment plan.
-    """
-    try:
-        lang_instruction = "Respond in Hindi." if language.lower() == 'hi' else "Respond in English."
-        prompt = f"""
-You are a medical AI assistant. {lang_instruction} Based on the following patient data, generate a personalized treatment plan. Reference relevant medical guidelines and literature where appropriate.
-
-Patient Data:
-{patient_data}
-
-Provide a detailed treatment plan, including medication recommendations, lifestyle changes, and any necessary follow-up tests or consultations.
-"""
-        logging.debug(f"LLM Prompt for treatment plan: {prompt}")
-
-        response = client.chat.completions.create(
-            model="gpt-4",
-            messages=[
-                {"role": "system", "content": "You are a helpful medical assistant generating personalized treatment plans based on patient data and medical literature."},
-                {"role": "user", "content": prompt},
-            ],
-            max_tokens=800,
-            temperature=0.7,
-        )
-        treatment_plan = response.choices[0].message.content.strip()
-        logging.info("Treatment plan generated successfully.")
-    except Exception as e:
-        logging.error(f"Error in generate_treatment_plan: {e}", exc_info=True)
-        treatment_plan = f"An error occurred: {e}"
-
-    return treatment_plan
-
-# Endpoint for Diagnosis with enhanced error handling
-@app.post("/diagnosis")
-async def diagnosis_endpoint(
-    request: Request,
-    patient_id: str = Form(...),
-    image: UploadFile = File(...),
-    patient_data: str = Form(...),
-    language: str = Form('en')  # Default to English
-):
-    """
-    Endpoint to perform diagnosis based on an uploaded image and patient data.
-    Accepts:
-        - patient_id: str
-        - image: UploadFile (JPEG or PNG)
-        - patient_data: str
-        - language: str ('en' or 'hi')
-    Returns:
-        - diagnosis: str
-        - audio: base64 encoded audio string
-    """
-    # Validate language
-    if language.lower() not in SUPPORTED_LANGUAGES:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unsupported language '{language}'. Supported languages are: {', '.join(SUPPORTED_LANGUAGES.keys())}."
-        )
-
-    try:
-        # Read and open the image
-        image_data = await image.read()
-        image_pil = Image.open(io.BytesIO(image_data)).convert('L')  # Ensure grayscale
-        logging.info(f"Image uploaded and converted to grayscale successfully for patient_id: {patient_id}")
-
-        # Log the diagnosis request
-        append_to_patient_history(patient_id, 'user', "Diagnosis Request with provided patient_data and image.")
-
-        # Get diagnosis, audio, and heatmap
-        diagnosis_text, audio_bytes, heatmap = get_diagnosis(image_pil, patient_data, language)
-
-        # Log the diagnosis response
-        append_to_patient_history(patient_id, 'assistant', diagnosis_text)
-
-        # Encode audio bytes to base64
-        audio_b64 = base64.b64encode(audio_bytes).decode('utf-8') if audio_bytes else None
-
-        return {"diagnosis": diagnosis_text, "audio": audio_b64}
-
-    except Exception as e:
-        logging.error(f"Error processing diagnosis for patient_id {patient_id}: {e}", exc_info=True)
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid image file: {e}"
-        )
-
-# Endpoint for Synthetic Report Generation with enhanced error handling
-@app.post("/generate_report")
-async def generate_report_endpoint(
-    request: Request,
-    patient_id: str = Form(...),
-    report_type: str = Form(...),
-    patient_age: int = Form(...),
-    patient_gender: str = Form(...),
-    medical_condition: str = Form(...),
-    language: str = Form('en')  # Default to English
-):
-    """
-    Endpoint to generate a synthetic medical report.
-    Accepts:
-        - patient_id: str
-        - report_type: str
-        - patient_age: int
-        - patient_gender: str
-        - medical_condition: str
-        - language: str ('en' or 'hi')
-    Returns:
-        - report: str
-    """
-    # Validate language
-    if language.lower() not in SUPPORTED_LANGUAGES:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unsupported language '{language}'. Supported languages are: {', '.join(SUPPORTED_LANGUAGES.keys())}."
-        )
-
-    try:
-        logging.info(f"Received report generation request from patient_id: {patient_id}")
-
-        # Log the report generation request
-        append_to_patient_history(patient_id, 'user', f"Generate Report Request: Type={report_type}, Age={patient_age}, Gender={patient_gender}, Condition={medical_condition}")
-
-        # Generate synthetic report
-        synthetic_report = generate_synthetic_report(report_type, patient_age, patient_gender, medical_condition, language)
-
-        # Log the report response
-        append_to_patient_history(patient_id, 'assistant', f"Synthetic Report: {synthetic_report}")
-
-        return {"report": synthetic_report}
-
-    except Exception as e:
-        logging.error(f"Error in generate_report_endpoint for patient_id {patient_id}: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Internal Server Error")
-
-# Endpoint for Treatment Plan Generation with enhanced error handling
-@app.post("/treatment_plan")
-async def treatment_plan_endpoint(
-    request: Request,
-    patient_id: str = Form(...),
-    patient_name: str = Form(...),
-    patient_age: int = Form(...),
-    patient_gender: str = Form(...),
-    medical_condition: str = Form(...),
-    current_medications: Optional[str] = Form(None),
-    allergies: Optional[str] = Form(None),
-    language: str = Form('en')  # Default to English
-):
-    """
-    Endpoint to generate a personalized treatment plan.
-    Accepts:
-        - patient_id: str
-        - patient_name: str
-        - patient_age: int
-        - patient_gender: str
-        - medical_condition: str
-        - current_medications: str (optional)
-        - allergies: str (optional)
-        - language: str ('en' or 'hi')
-    Returns:
-        - treatment_plan: str
-    """
-    # Validate language
-    if language.lower() not in SUPPORTED_LANGUAGES:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unsupported language '{language}'. Supported languages are: {', '.join(SUPPORTED_LANGUAGES.keys())}."
-        )
-
-    try:
-        logging.info(f"Received treatment plan request from patient_id: {patient_id}")
-        logging.debug(f"Patient Name: {patient_name}")
-        # ... other debug logs ...
-
-        # Log the request
-        append_to_patient_history(patient_id, 'user', f"Treatment Plan Request: Name={patient_name}, Age={patient_age}, Gender={patient_gender}, Condition={medical_condition}, Medications={current_medications}, Allergies={allergies}")
-
-        # Construct patient_data
-        patient_data = f"""
-        Name: {patient_name}
-        Age: {patient_age}
-        Gender: {patient_gender}
-        Medical Condition: {medical_condition}
-        Current Medications: {current_medications or 'None'}
-        Allergies: {allergies or 'None'}
-        """
-
-        # Log patient data
-        append_to_patient_history(patient_id, 'system', "Patient Data: " + patient_data)
-
-        # Generate treatment plan
-        treatment_plan = generate_treatment_plan(patient_data, language)
-        logging.info("Treatment plan generated successfully.")
-
-        # Log the response
-        append_to_patient_history(patient_id, 'assistant', f"Treatment Plan: {treatment_plan}")
-
-        return {"treatment_plan": treatment_plan}
-
-    except Exception as e:
-        logging.error(f"Error in treatment_plan_endpoint for patient_id {patient_id}: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Internal Server Error")
-
-# Define a Pydantic model for chatbot requests
 class ChatbotRequest(BaseModel):
     patient_id: str
     message: str
     language: str = 'en'
 
-# Chatbot endpoint
+@app.post("/upload_medical_file")
+async def upload_medical_file(
+    file: UploadFile,
+    file_type: str = Form(...),
+    patient_id: str = Form(...)
+):
+    """Upload and process medical files"""
+    try:
+        result = await medical_ai.process_medical_file(file, file_type)
+        append_to_patient_history(
+            patient_id,
+            'system',
+            f"Processed {file_type} file: {file.filename}"
+        )
+        return result
+    except Exception as e:
+        logger.error(f"Error processing medical file: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/diagnosis")
+async def get_diagnosis(request: DiagnosisRequest):
+    """Get comprehensive diagnosis"""
+    try:
+        diagnosis = await medical_ai.generate_diagnosis(
+            request.patient_data,
+            request.medical_files
+        )
+        append_to_patient_history(
+            request.patient_id,
+            'system',
+            f"Generated diagnosis based on {len(request.medical_files)} medical files"
+        )
+        return diagnosis
+    except Exception as e:
+        logger.error(f"Error getting diagnosis: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.post("/chatbot")
 async def chatbot_endpoint(request: ChatbotRequest):
+    """
+    Chatbot endpoint supporting English, Hindi, and Telugu
+    """
     try:
-        patient_id = request.patient_id
-        user_message = request.message
-        language = request.language.lower()
-
-        logging.info(f"Chatbot request from patient_id: {patient_id}")
-        logging.debug(f"User message: {user_message}")
-        logging.debug(f"Language: {language}")
-
+        logger.info(f"Received chatbot request - Patient ID: {request.patient_id}, Language: {request.language}")
+        
+        # Normalize language code to lowercase
+        language = request.language
+        
         # Validate language
         if language not in SUPPORTED_LANGUAGES:
+            logger.warning(f"Unsupported language requested: {language}")
             raise HTTPException(
                 status_code=400,
-                detail=f"Unsupported language '{language}'. Supported languages are: {', '.join(SUPPORTED_LANGUAGES.keys())}."
+                detail={
+                    "error": "Unsupported language",
+                    "message": "Supported languages are: English (en), Hindi (hi), and Telugu (te)",
+                    "supported_languages": list(SUPPORTED_LANGUAGES.keys())
+                }
             )
 
         # Load conversation history
-        conversation = load_patient_history(patient_id)
+        conversation = load_patient_history(request.patient_id)
+        
+        # Prepare system prompt with language instruction
+        lang_instruction = SUPPORTED_LANGUAGES[language]
+        system_prompt = f"""You are a medical AI assistant who is an expert in various medical fields. {lang_instruction}
 
-        # Append the user's message
-        append_to_patient_history(patient_id, 'user', user_message)
+Your capabilities include:
+- Diagnosing medical conditions based on symptoms
+- Explaining medical procedures and treatments
+- Providing general health advice
+- Answering questions about medications
+- Offering preventive healthcare recommendations
 
-        # Prepare the prompt for the AI model
-        lang_instruction = SUPPORTED_LANGUAGES.get(language, SUPPORTED_LANGUAGES['en'])
-        # Include system instructions if not already present
-        system_message = {"role": "system", "content": f"You are a helpful medical assistant. {lang_instruction}"}
-        if not any(msg['role'] == 'system' for msg in conversation):
-            conversation.insert(0, system_message)
-
+Remember to:
+1. Always maintain medical accuracy
+2. Be clear and empathetic in your responses
+3. Suggest consulting a healthcare provider when appropriate
+4. Keep responses culturally appropriate for the language being used
+5. Always prescribe remedy or Ayurvedic remedies
+6. Always prescribe some meal plans and course of actions
+7. also suggest which type of yoga and exercise could help
+"""
+        
         # Prepare messages for OpenAI
-        messages = conversation.copy()
-
-        # Call OpenAI API
+        messages = [
+            {"role": "system", "content": system_prompt}
+        ]
+        
+        # Add recent conversation history (last 5 messages)
+        for msg in conversation[-5:]:
+            if msg['role'] != 'system':
+                messages.append({
+                    "role": msg['role'],
+                    "content": msg['content']
+                })
+        
+        # Add current message
+        messages.append({
+            "role": "user",
+            "content": request.message
+        })
+        
+        # Get response from GPT-4
         response = client.chat.completions.create(
             model="gpt-4",
             messages=messages,
-            max_tokens=500,
             temperature=0.7,
+            max_tokens=800,
+        )
+        
+        ai_response = response.choices[0].message.content.strip()
+        
+        # Save to history
+        append_to_patient_history(request.patient_id, 'user', request.message)
+        append_to_patient_history(request.patient_id, 'assistant', ai_response)
+        
+        # Generate audio response
+        audio_bytes = None
+        try:
+            # Map language codes for gTTS
+            tts_language_map = {
+                'en-GB': 'en-GB',
+                'hi': 'hi',
+                'te': 'te'
+            }
+            
+            tts_language = tts_language_map.get(language, 'en-GB')
+            tts = gTTS(text=ai_response, lang=tts_language)
+            audio_io = io.BytesIO()
+            tts.write_to_fp(audio_io)
+            audio_io.seek(0)
+            audio_bytes = base64.b64encode(audio_io.read()).decode('utf-8')
+        except Exception as e:
+            logger.warning(f"Error generating audio response: {e}")
+            
+        logger.info(f"Successfully generated response for Patient ID: {request.patient_id}")
+        
+        return {
+            "response": ai_response,
+            "audio": audio_bytes,
+            "language": language
+        }
+            
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        logger.error(f"Unexpected error in chatbot endpoint: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "Internal server error",
+                "message": "An unexpected error occurred while processing your request"
+            }
         )
 
-        ai_response = response.choices[0].message.content.strip()
+class TreatmentPlanRequest(BaseModel):
+    patient_id: str
+    diagnosis: dict
+    patient_data: dict
+    language: str = 'en-GB'
 
-        # Append the AI's response to the conversation history
-        append_to_patient_history(patient_id, 'assistant', ai_response)
-
-        return {"response": ai_response}
-
+@app.post("/treatment_plan")
+async def get_treatment_plan(request: TreatmentPlanRequest):
+    """Generate personalized treatment plan"""
+    try:
+        # Validate language
+        if request.language not in SUPPORTED_LANGUAGES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported language. Supported languages are: {', '.join(SUPPORTED_LANGUAGES.keys())}"
+            )
+        
+        lang_instruction = SUPPORTED_LANGUAGES[request.language]
+        
+        prompt = f"""
+        {lang_instruction}
+        
+        Based on the following diagnosis and patient data, generate a comprehensive treatment plan:
+        
+        Patient Information:
+        {json.dumps(request.patient_data, indent=2)}
+        
+        Diagnosis:
+        {json.dumps(request.diagnosis, indent=2)}
+        
+        Please provide:
+        1. Detailed treatment recommendations
+        2. Medication plan (if needed)
+        3. Lifestyle modifications
+        4. Follow-up schedule
+        5. Warning signs to watch for
+        6. Preventive measures
+        7. Dietary recommendations
+        8. Exercise recommendations (if appropriate)
+        9. Recovery milestones and expectations
+        10. When to seek immediate medical attention
+        """
+        
+        response = client.chat.completions.create(
+            model="gpt-4",
+            messages=[
+                {"role": "system", "content": "You are an expert medical AI system creating personalized treatment plans."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.7,
+            max_tokens=1000
+        )
+        
+        treatment_plan = response.choices[0].message.content.strip()
+        
+        # Save to patient history
+        append_to_patient_history(
+            request.patient_id,
+            'system',
+            f"Generated treatment plan based on diagnosis dated {request.diagnosis.get('timestamp', 'N/A')}"
+        )
+        
+        # Generate audio version if needed
+        audio_bytes = None
+        try:
+            tts_language = 'en-GB'
+            if request.language in ['hi', 'te']:
+                tts_language = request.language
+                
+            tts = gTTS(text=treatment_plan, lang=tts_language)
+            audio_io = io.BytesIO()
+            tts.write_to_fp(audio_io)
+            audio_io.seek(0)
+            audio_bytes = base64.b64encode(audio_io.read()).decode('utf-8')
+        except Exception as e:
+            logger.warning(f"Error generating audio for treatment plan: {e}")
+        
+        return {
+            "treatment_plan": treatment_plan,
+            "audio": audio_bytes,
+            "timestamp": datetime.now().isoformat()
+        }
+        
     except Exception as e:
-        logging.error(f"Error in chatbot_endpoint: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Internal Server Error")
+        logger.error(f"Error generating treatment plan: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+class FollowUpRequest(BaseModel):
+    patient_id: str
+    previous_diagnosis: dict
+    previous_treatment_plan: dict
+    new_symptoms: List[str]
+    current_medications: List[str]
+    language: str = 'en-GB'
+
+@app.post("/follow_up")
+async def get_follow_up_recommendations(request: FollowUpRequest):
+    """Generate follow-up recommendations"""
+    try:
+        if request.language not in SUPPORTED_LANGUAGES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported language. Supported languages are: {', '.join(SUPPORTED_LANGUAGES.keys())}"
+            )
+            
+        lang_instruction = SUPPORTED_LANGUAGES[request.language]
+        
+        prompt = f"""
+        {lang_instruction}
+        
+        Review the following follow-up information and provide recommendations:
+        
+        Previous Diagnosis:
+        {json.dumps(request.previous_diagnosis, indent=2)}
+        
+        Previous Treatment Plan:
+        {json.dumps(request.previous_treatment_plan, indent=2)}
+        
+        New Symptoms:
+        {json.dumps(request.new_symptoms, indent=2)}
+        
+        Current Medications:
+        {json.dumps(request.current_medications, indent=2)}
+        
+        Please provide:
+        1. Assessment of progress
+        2. Recommendations for treatment adjustments
+        3. Additional tests needed (if any)
+        4. Modified lifestyle recommendations
+        5. Next follow-up timeline
+        """
+        
+        response = client.chat.completions.create(
+            model="gpt-4",
+            messages=[
+                {"role": "system", "content": "You are an expert medical AI system providing follow-up care recommendations."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.7,
+            max_tokens=800
+        )
+        
+        follow_up_recommendations = response.choices[0].message.content.strip()
+        
+        append_to_patient_history(
+            request.patient_id,
+            'system',
+            "Generated follow-up recommendations"
+        )
+        
+        return {
+            "recommendations": follow_up_recommendations,
+            "timestamp": datetime.now().isoformat()
+        }
+        
+    except Exception as e:
+        logger.error(f"Error generating follow-up recommendations: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=True,
+        log_level="info"
+    )
